@@ -9,6 +9,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -165,5 +166,63 @@ internal class HttpResponseForTest {
             executor.shutdownNow()
             assertThat(executor.awaitTermination(5, TimeUnit.SECONDS)).isTrue()
         }
+    }
+
+    @Test
+    fun parseWaiterParksWhileAnotherThreadParses() {
+        val parsing = CountDownLatch(1)
+        val releaseParsing = CountDownLatch(1)
+        val response = mock<HttpResponse>()
+        val raw =
+            response.parseable {
+                parsing.countDown()
+                check(releaseParsing.await(5, TimeUnit.SECONDS))
+                "body"
+            }
+        val parserFailure = AtomicReference<Throwable?>()
+        val waiterFailure = AtomicReference<Throwable?>()
+        val parser = Thread {
+            try {
+                raw.parse()
+            } catch (error: Throwable) {
+                parserFailure.set(error)
+            }
+        }
+        val waiterReady = CountDownLatch(1)
+        val waiter = Thread {
+            waiterReady.countDown()
+            try {
+                raw.parse()
+            } catch (error: Throwable) {
+                waiterFailure.set(error)
+            }
+        }
+
+        try {
+            parser.start()
+            assertThat(parsing.await(5, TimeUnit.SECONDS)).isTrue()
+            waiter.start()
+            assertThat(waiterReady.await(5, TimeUnit.SECONDS)).isTrue()
+
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (
+                waiter.isAlive &&
+                    waiter.state != Thread.State.WAITING &&
+                    waiter.state != Thread.State.BLOCKED &&
+                    System.nanoTime() < deadline
+            ) {
+                Thread.yield()
+            }
+            assertThat(waiter.state).isEqualTo(Thread.State.WAITING)
+        } finally {
+            releaseParsing.countDown()
+            parser.join(TimeUnit.SECONDS.toMillis(5))
+            waiter.join(TimeUnit.SECONDS.toMillis(5))
+        }
+
+        assertThat(parser.isAlive).isFalse()
+        assertThat(waiter.isAlive).isFalse()
+        assertThat(parserFailure.get()).isNull()
+        assertThat(waiterFailure.get()).isNull()
     }
 }
