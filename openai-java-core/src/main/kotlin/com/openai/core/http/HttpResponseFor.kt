@@ -1,19 +1,36 @@
 package com.openai.core.http
 
 import java.io.InputStream
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 interface HttpResponseFor<T> : HttpResponse {
 
     fun parse(): T
 }
 
+private class ParsedValue<T>(val value: T)
+
 @JvmSynthetic
-internal fun <T> HttpResponse.parseable(parse: () -> T): HttpResponseFor<T> =
+internal fun <T> HttpResponse.parseable(parser: () -> T): HttpResponseFor<T> =
     object : HttpResponseFor<T> {
 
-        private val parsed = lazy { parse() }
+        private val parseLock = ReentrantLock()
 
-        override fun parse(): T = parsed.value
+        @Volatile private var parsed: ParsedValue<T>? = null
+
+        override fun parse(): T {
+            parsed?.let { return it.value }
+
+            return parseLock.withLock {
+                val current = parsed
+                if (current != null) {
+                    current.value
+                } else {
+                    parser().also { parsed = ParsedValue(it) }
+                }
+            }
+        }
 
         override fun statusCode(): Int = this@parseable.statusCode()
 
@@ -22,7 +39,7 @@ internal fun <T> HttpResponse.parseable(parse: () -> T): HttpResponseFor<T> =
         override fun body(): InputStream = this@parseable.body()
 
         override fun close() {
-            val stream = if (parsed.isInitialized()) parsed.value as? StreamResponse<*> else null
+            val stream = parsed?.value as? StreamResponse<*>
             if (stream != null) {
                 stream.close()
             } else {
